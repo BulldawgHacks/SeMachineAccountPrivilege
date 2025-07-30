@@ -1,12 +1,36 @@
 import os
 import argparse
 import tempfile
+from ldap3 import Server, Connection, ALL, NTLM
+import base64
 from impacket.smbconnection import SMBConnection
-from configparser import ConfigParser
-
 
 DEFAULT_DC_POLICY_GUID = "{6AC1786C-016F-11D2-945F-00C04FB984F9}"
 GPT_RELATIVE_PATH = f"Machine/Microsoft/Windows NT/SecEdit/GptTmpl.inf"
+
+def resolve_sids_ldap(dc_ip, username, password, domain, sids):
+    resolved = {}
+    user = f"{domain}\\{username}"
+
+    try:
+        server = Server(dc_ip, get_info=ALL)
+        conn = Connection(server, user=user, password=password, authentication=NTLM, auto_bind=True)
+        for sid in sids:
+            sid = sid.strip("*")
+            search_filter = f"(objectSid={sid})"
+            conn.search(search_base=f"DC={domain.replace('.', ',DC=')}",
+                        search_filter=search_filter,
+                        attributes=["sAMAccountName"])
+            if conn.entries:
+                entry = conn.entries[0]
+                name = entry.sAMAccountName.value
+                resolved[sid] = name
+            else:
+                resolved[sid] = "Not found"
+
+    except Exception as e:
+        print(f"[!] LDAP SID resolution failed: {e}")
+    return resolved
 
 
 def connect_to_smb(dc_ip, username, password, domain=''):
@@ -18,21 +42,6 @@ def connect_to_smb(dc_ip, username, password, domain=''):
         print(f"[!] Failed to connect to SMB: {e}")
         return None
 
-
-def find_domain_folder(conn):
-    """Automatically find the domain folder inside SYSVOL"""
-    try:
-        share = 'SYSVOL'
-        base_path = 'sysvol'
-        for entry in conn.listPath(share, f'/{base_path}'):
-            name = entry.get_longname()
-            if name not in ('.', '..'):
-                return name  # Assuming only one domain folder
-    except Exception as e:
-        print(f"[!] Error finding domain folder: {e}")
-    return None
-
-
 def extract_sids_from_gpttmpl(conn, gpt_path):
     share = 'SYSVOL'
     local_temp = tempfile.mktemp()
@@ -40,16 +49,20 @@ def extract_sids_from_gpttmpl(conn, gpt_path):
     try:
         with open(local_temp, 'wb') as f:
             conn.getFile(share, gpt_path, f.write)
-    except Exception:
+    except Exception as e:
         return []  # File not found or access denied
 
     sids = []
     try:
-        parser = ConfigParser(strict=False)
-        parser.read(local_temp)
-        if parser.has_section('Privilege Rights') and parser.has_option('Privilege Rights', 'SeMachineAccountPrivilege'):
-            line = parser.get('Privilege Rights', 'SeMachineAccountPrivilege')
-            sids = [sid.strip() for sid in line.split(',')]
+        with open(local_temp, "r", encoding="utf-16") as gpo_file:
+            gpo_lines = gpo_file.read().split("\n")
+        for line in gpo_lines:
+            if "SeMachineAccountPrivilege" in line:
+                sid_line = line.split("=")[1].strip()
+                if "," in sid_line:
+                    sids = [sid.strip() for sid in sid_line.split(",")]
+                else:
+                    sids.append(sid_line)
     except Exception as e:
         print(f"[!] Failed to parse {gpt_path}: {e}")
     finally:
@@ -63,7 +76,7 @@ def parse_arguments():
     parser.add_argument("--dc-ip", required=True, help="Domain controller IP address")
     parser.add_argument("--username", required=True, help="Username for SMB auth")
     parser.add_argument("--password", required=True, help="Password for SMB auth")
-    parser.add_argument("--domain", default='', help="Domain name (optional)")
+    parser.add_argument("--domain", required=True, help="Domain name")
     return parser.parse_args()
 
 
@@ -73,18 +86,19 @@ def main():
     if not conn:
         return
 
-    domain_folder = find_domain_folder(conn)
-    if not domain_folder:
-        print("[!] Could not find domain folder inside SYSVOL.")
-        return
-
-    gpt_path = f"/sysvol/{domain_folder}/Policies/{DEFAULT_DC_POLICY_GUID}/{GPT_RELATIVE_PATH}"
+    gpt_path = f"/{args.domain}/Policies/{DEFAULT_DC_POLICY_GUID}/{GPT_RELATIVE_PATH}"
     sids = extract_sids_from_gpttmpl(conn, gpt_path)
 
     if sids:
         print(f"[+] Found SeMachineAccountPrivilege in Default Domain Controllers Policy:")
+        resolved = resolve_sids_ldap(args.dc_ip, args.username, args.password, args.domain, sids)
         for sid in sids:
-            print(f"    {sid}")
+            sid = sid.strip("*")
+            if sid == "S-1-5-11":
+                name = "Authenticated Users"
+            else:
+                name = resolved.get(sid, "Unknown")
+            print(f"    {sid} -> {name}")
     else:
         print("[!] No SeMachineAccountPrivilege entries found or GptTmpl.inf not present.")
 
